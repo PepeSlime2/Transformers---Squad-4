@@ -1,0 +1,33 @@
+# Framework principal (versões mais testadas)
+torch>=2.0.1,<2.2.0
+transformers>=4.36.0,<4.39.0
+datasets>=2.15.0,<2.17.0
+
+# MLflow para rastreamento de experimentos
+mlflow>=2.8.1
+
+# Métricas de avaliação
+evaluate>=0.4.0
+scikit-learn>=1.3.0
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
+
+# Quantização 4-bit 
+bitsandbytes>=0.41.3  
+
+# Análise de dados
+pandas>=1.5.0,<2.2.0  
+numpy>=1.24.0,<1.26.0
+
+# Visualização (OPCIONAL)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilidades essenciais
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0,<4.0.0
+tqdm>=4.65.0           
+
+# Para BERT/RoBERTa tokenizers
+tokenizers>=0.14.0     
