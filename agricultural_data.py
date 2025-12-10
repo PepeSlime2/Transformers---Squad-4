@@ -44,6 +44,14 @@ CITRUS_TEXTS = [
     entrelinhas e aplicação de herbicidas na linha de plantio são práticas 
     comuns na citricultura moderna.
     """
+    ,
+    """
+    A correção da acidez do solo (calagem) e a adubação correta são essenciais
+    para o estabelecimento e produtividade dos pomares cítricos. Recomenda-se
+    realizar análise de solo a cada 3-4 anos; calagem para elevar o pH quando
+    o solo estiver ácido e aplicação de fósforo no plantio, além de potássio
+    e nitrogênio conforme resultados da análise de solo.
+    """
 ]
 
 # Textos de exemplo sobre Café
@@ -82,6 +90,14 @@ COFFEE_TEXTS = [
     de nitrogênio durante o período chuvoso maximizam a eficiência de uso 
     do nutriente e reduzem perdas por lixiviação.
     """
+
+    ,
+    """
+    A calagem em cafezais visa corrigir a acidez do solo e melhorar a disponibilidade
+    de nutrientes; recomenda-se dose calculada a partir da análise de solo e aplicação
+    antes do plantio ou entre safras. A adubação de manutenção inclui parcelamento
+    do nitrogênio e suplementação de potássio e fósforo conforme a demanda da lavoura.
+    """
 ]
 
 # Perguntas e respostas para testes de QA
@@ -110,6 +126,17 @@ QA_EXAMPLES = [
         "question": "Como deve ser realizado o armazenamento de café beneficiado?",
         "context": COFFEE_TEXTS[3],
         "answer": "Com controle rigoroso de umidade (abaixo de 12%) e temperatura, em armazéns bem ventilados."
+    }
+    ,
+    {
+        "question": "Quando é indicada a calagem em pomares de citros?",
+        "context": CITRUS_TEXTS[5],
+        "answer": "Quando a análise de solo indicar acidez excessiva; calagem deve ser aplicada na dose recomendada pela análise para elevar o pH a níveis ideais."
+    },
+    {
+        "question": "Como deve ser feita a adubação de manutenção em cafeeiros adultos?",
+        "context": COFFEE_TEXTS[5],
+        "answer": "Aplicações parceladas de nitrogênio durante o período chuvoso, com suplementação de fósforo e potássio conforme análise de solo."
     }
 ]
 
