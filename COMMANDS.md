@@ -492,6 +492,28 @@ pip install --force-reinstall --no-cache-dir torch transformers
 pip check
 ```
 
+## 🧪 Experimentos
+
+### Executar todos os experimentos (geração + classificação)
+```powershell
+python experiments/run_all_experiments.py
+```
+
+### Executar apenas experimento de geração
+```powershell
+python experiments/transformers_geracao.py
+```
+
+### Executar apenas experimento de classificação
+```powershell
+python experiments/transformers_classificacao.py
+```
+
+### Executar experimento de classificação com fine-tuning
+```powershell
+python experiments/transformers_classificacao.py --fine_tune
+```
+
 ---
 
 **Nota**: Estes comandos são para PowerShell no Windows. Para outros shells ou sistemas operacionais, adapte conforme necessário.

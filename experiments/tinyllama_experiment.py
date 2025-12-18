@@ -1,4 +1,4 @@
-from benchmark_lite import benchmark_llama
+from benchmark_definitivo import benchmark_tinyllama_optimized
 
 if __name__ == '__main__':
-    benchmark_llama()
+    benchmark_tinyllama_optimized()

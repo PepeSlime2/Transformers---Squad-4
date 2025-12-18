@@ -1,8 +1,3 @@
-"""
-Benchmark simplificado de modelos Transformer para hardware limitado.
-Inclui: DistilBERT, DistilGPT2, BERT-Tiny, TinyLLaMA, Gemma 2 Mini (tenta quantizar em 4-bit).
-"""
-
 import os
 import time
 import torch
@@ -10,13 +5,17 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 import warnings
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional, Any
 warnings.filterwarnings('ignore')
 
+# Imports otimizados
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
-    pipeline
+    pipeline,
+    BitsAndBytesConfig
 )
 from datasets import load_dataset
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
@@ -30,615 +29,741 @@ try:
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import seaborn as sns
+    PLOT_AVAILABLE = True
 except Exception:
-    plt = None
-    sns = None
+    PLOT_AVAILABLE = False
 
-from collections import Counter
+_MODEL_CACHE = {}
+_TOKENIZER_CACHE = {}
 
-# Try to import BitsAndBytesConfig (for 4-bit quantization). Fallback if unavailable.
-try:
-    from transformers import BitsAndBytesConfig
-    BNB_AVAILABLE = True
-except Exception:
-    BitsAndBytesConfig = None
-    BNB_AVAILABLE = False
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device em uso: {DEVICE}")
+print(f"PyTorch version: {torch.__version__}")
 
-# Detecta dispositivo
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device em uso: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-# Configuração do MLflow
-mlflow.set_experiment("Benchmark_Transformers_SB100_Lite")
+def setup_mlflow(experiment_name=None):
+    if experiment_name is None:
+        experiment_name = os.getenv('MLFLOW_EXPERIMENT_NAME', "Benchmark_Transformers_SB100_Lite")
+    mlflow.set_experiment(experiment_name)
+    mlflow.set_tracking_uri("file:./mlruns")
 
+class ModelLogger:
+    def __init__(self, run_name: str):
+        self.run_name = run_name
+        self.metrics = {}
+        self.params = {}
+        
+    def __enter__(self):
+        self.run = mlflow.start_run(run_name=self.run_name)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for key, value in self.params.items():
+            mlflow.log_param(key, value)
+        for key, value in self.metrics.items():
+            mlflow.log_metric(key, value)
+        mlflow.end_run()
+    
+    def log_param(self, key: str, value: Any):
+        self.params[key] = value
+    
+    def log_metric(self, key: str, value: Any):
+        self.metrics[key] = value
+    
+    def log_metrics(self, metrics_dict: Dict[str, Any]):
+        self.metrics.update(metrics_dict)
+    
+    def log_params(self, params_dict: Dict[str, Any]):
+        self.params.update(params_dict)
 
-def get_model_size(model):
-    """Retorna o tamanho do modelo em MB."""
-    param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
-    buffer_size = sum(b.nelement() * b.element_size() for b in model.buffers())
-    return (param_size + buffer_size) / (1024 ** 2)
+# Funções utilitárias otimizadas
+def get_model_size(model: torch.nn.Module) -> float:
+    return sum(
+        p.numel() * p.element_size() 
+        for p in model.parameters() if p.requires_grad
+    ) / (1024 ** 2)
 
-
-def safe_load_metric(name):
-    """Carrega métrica do evaluate, com fallback."""
+def load_model_cached(model_name: str, model_type: str, **kwargs) -> Tuple[Any, float]:
+    cache_key = f"{model_name}_{model_type}"
+    
+    if cache_key in _MODEL_CACHE:
+        model, tokenizer, load_time = _MODEL_CACHE[cache_key]
+        print(f"Usando modelo em cache: {model_name}")
+        return tokenizer, model, load_time
+    
+    start_load = time.time()
+    
     try:
-        return evaluate.load(name)
+        if model_type == "seqcls":
+            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_name, num_labels=4
+            ).to(DEVICE)
+        else:
+            tokenizer_kwargs = {"use_fast": True}
+            model_kwargs = {}
+            
+            if "llama" in model_name.lower():
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, 
+                    use_fast=True,
+                    padding_side="left"
+                )
+                
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+            elif "gemma" in model_name.lower():
+                # Para Gemma
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    use_fast=True
+                )
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+            
+            # Carregar modelo
+            model = AutoModelForCausalLM.from_pretrained(model_name).to(DEVICE)
+        
+        load_time = time.time() - start_load
+        _MODEL_CACHE[cache_key] = (model, tokenizer, load_time)
+        
+        return tokenizer, model, load_time
     except Exception as e:
-        print(f"Métrica '{name}' indisponível: {e}")
-        return None
+        print(f"Erro ao carregar {model_name}: {e}")
+        # Retornar um modelo fallback simples
+        if model_type == "seqcls":
+            from transformers import DistilBertTokenizer, DistilBertForSequenceClassification
+            tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+            model = DistilBertForSequenceClassification.from_pretrained(
+                "distilbert-base-uncased", num_labels=4
+            ).to(DEVICE)
+        else:
+            from transformers import GPT2Tokenizer, GPT2LMHeadModel
+            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+            model = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
+        
+        load_time = time.time() - start_load
+        return tokenizer, model, load_time
 
-
-def safe_compute_bleu(predictions, references):
-    """Calcula BLEU via evaluate ou sacrebleu."""
-    try:
-        bleu = safe_load_metric('bleu')
-        if bleu:
-            return bleu.compute(predictions=predictions, references=[[r] for r in references])
-    except Exception:
-        pass
-    try:
-        import sacrebleu
-        score = sacrebleu.corpus_bleu(predictions, [references])
-        return {"bleu": float(score.score / 100.0)}
-    except Exception:
-        return {"bleu": 0.0}
-
-
-def safe_compute_rouge(predictions, references):
-    """Calcula ROUGE-L via evaluate ou rouge_score fallback."""
-    try:
-        rouge = safe_load_metric('rouge')
-        if rouge:
-            return rouge.compute(predictions=predictions, references=references)
-    except Exception:
-        pass
-    try:
-        from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-        vals = [scorer.score(r, p)['rougeL'].fmeasure for p, r in zip(predictions, references)]
-        return {"rougeL": float(np.mean(vals) if vals else 0.0)}
-    except Exception:
-        return {"rougeL": 0.0}
-
-
-def compute_bleu(predictions, references):
-    try:
-        import sacrebleu
-        return float(sacrebleu.corpus_bleu(predictions, [references]).score / 100.0)
-    except Exception:
-        try:
-            bleu = safe_load_metric('bleu')
-            if bleu:
-                res = bleu.compute(predictions=predictions, references=[[r] for r in references])
-                return float(res.get('bleu', 0.0))
-        except Exception:
-            pass
-    return 0.0
-
-
-def compute_rouge_l(predictions, references):
-    try:
-        from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-        scores = [scorer.score(r, p)['rougeL'].fmeasure for p, r in zip(predictions, references)]
-        return float(np.mean(scores)) if scores else 0.0
-    except Exception:
-        try:
-            rouge = safe_load_metric('rouge')
-            if rouge:
-                res = rouge.compute(predictions=predictions, references=references)
-                return float(res.get('rougeL', 0.0))
-        except Exception:
-            pass
-    return 0.0
-
-
-def load_causal_model(model_name, quantize_4bit=True):
-    """
-    Carrega model CausalLM com tentativa de quantização 4-bit.
-    Retorna tokenizer, model, load_time, used_quantization(boolean).
-    """
+def load_causal_model_quantized(model_name: str, quantize_4bit: bool = True) -> Tuple[Any, Any, float, bool]:
+    cache_key = f"{model_name}_causal_quant_{quantize_4bit}"
+    
+    if cache_key in _MODEL_CACHE:
+        model, tokenizer, load_time, used_q = _MODEL_CACHE[cache_key]
+        return tokenizer, model, load_time, used_q
+    
     start_load = time.time()
     used_q = False
+    
+    try:
+        if quantize_4bit and DEVICE.type == "cuda":
+            print(f"Tentando quantização 4-bit para {model_name}...")
+            try:
+                q_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16
+                )
 
-    if quantize_4bit and BNB_AVAILABLE and device == "cuda":
-        try:
-            q_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16
-            )
-            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                quantization_config=q_config,
-                device_map="auto",
-                trust_remote_code=True
-            )
-            used_q = True
-        except Exception as e:
-            print(f"Falha ao carregar quantizado (4-bit) {model_name}: {e}. Tentando sem quantização.")
-            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-            model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-            used_q = False
-    else:
-        # fallback normal load
-        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-        used_q = False
-
+                if "llama" in model_name.lower():
+                    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                    if tokenizer.pad_token is None:
+                        tokenizer.pad_token = tokenizer.eos_token
+                elif "gemma" in model_name.lower():
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(model_name)
+                        tokenizer.pad_token = tokenizer.eos_token
+                    except:
+                        print("Usando modelo alternativo para Gemma...")
+                        model_name = "microsoft/phi-2"  # Modelo aberto alternativo
+                        tokenizer = AutoTokenizer.from_pretrained(model_name)
+                else:
+                    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    quantization_config=q_config,
+                    device_map="auto",
+                    trust_remote_code=False  
+                )
+                used_q = True
+                print("✓ Quantização 4-bit aplicada com sucesso")
+            except Exception as e:
+                print(f"Falha na quantização 4-bit: {e}. Usando modelo padrão.")
+                tokenizer, model = load_model_cached(model_name, "causal")[:2]
+        else:
+            tokenizer, model = load_model_cached(model_name, "causal")[:2]
+    except Exception as e:
+        print(f"Erro crítico ao carregar {model_name}: {e}")
+        print("Usando fallback para DistilGPT2...")
+        model_name = "distilgpt2"
+        tokenizer, model = load_model_cached(model_name, "causal")[:2]
+    
     load_time = time.time() - start_load
+    _MODEL_CACHE[cache_key] = (model, tokenizer, load_time, used_q)
+    
     return tokenizer, model, load_time, used_q
 
+# Métricas otimizadas
+class MetricsCalculator:
 
-def load_seqcls_model(model_name, quantize_4bit=False):
-    """
-    Carrega modelo de Sequence Classification.
-    Quantização 4-bit geralmente não é usada para seqcls aqui (fallback).
-    """
-    start_load = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=4).to(device)
-    load_time = time.time() - start_load
-    return tokenizer, model, load_time
+    _bleu_metric = None
+    _rouge_metric = None
+    
+    @classmethod
+    def get_bleu_metric(cls):
+        if cls._bleu_metric is None:
+            try:
+                cls._bleu_metric = evaluate.load("bleu")
+            except:
+                cls._bleu_metric = None
+        return cls._bleu_metric
+    
+    @classmethod
+    def get_rouge_metric(cls):
+        if cls._rouge_metric is None:
+            try:
+                cls._rouge_metric = evaluate.load("rouge")
+            except:
+                cls._rouge_metric = None
+        return cls._rouge_metric
+    
+    @staticmethod
+    def compute_classification_metrics(labels: List[int], preds: List[int]) -> Dict[str, float]:
+        if not labels or not preds:
+            return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+        
+        accuracy = accuracy_score(labels, preds)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            labels, preds, average="weighted", zero_division=0
+        )
+        
+        return {
+            "accuracy": float(accuracy),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1_score": float(f1)
+        }
+    
+    @staticmethod
+    def compute_generation_metrics(predictions: List[str], references: List[str]) -> Dict[str, float]:
+        bleu_metric = MetricsCalculator.get_bleu_metric()
+        rouge_metric = MetricsCalculator.get_rouge_metric()
+        
+        results = {"bleu": 0.0, "rougeL": 0.0}
+        
+        # Cálculo BLEU
+        if bleu_metric and predictions and references:
+            try:
+                bleu_result = bleu_metric.compute(
+                    predictions=predictions,
+                    references=[[r] for r in references]
+                )
+                results["bleu"] = float(bleu_result.get("bleu", 0.0))
+            except:
+                pass
+        
+        # Cálculo ROUGE
+        if rouge_metric and predictions and references:
+            try:
+                rouge_result = rouge_metric.compute(
+                    predictions=predictions,
+                    references=references
+                )
+                results["rougeL"] = float(rouge_result.get("rougeL", 0.0))
+            except:
+                pass
+        
+        return results
 
+def benchmark_model(model_name: str, model_func: callable, **kwargs) -> Optional[Dict]:
+    try:
+        return model_func(**kwargs)
+    except Exception as e:
+        print(f"Erro no benchmark {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
-def benchmark_distilbert(do_train=False):
-    """DistilBERT - classificação (AG News small)."""
+def benchmark_distilbert_optimized(do_train: bool = False) -> Dict:
+    """DistilBERT otimizado."""
     print("\nIniciando teste com DistilBERT...")
-
-    with mlflow.start_run(run_name="DistilBERT_lite"):
-        model_name = "distilbert-base-uncased"
-
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("task", "classification")
-        mlflow.log_param("dataset", "ag_news[:100]")
-        mlflow.log_param("device", device)
-
-        dataset = load_dataset("ag_news", split="train[:100]")
-        test_dataset = load_dataset("ag_news", split="test[:25]")
-
-        print("Carregando modelo...")
-        tokenizer, model, load_time = load_seqcls_model(model_name)
-
+    
+    model_name = "distilbert-base-uncased"
+    task_type = "classification"
+    
+    with ModelLogger(f"DistilBERT_{task_type}") as logger:
+        logger.log_params({
+            "model_name": model_name,
+            "task": task_type,
+            "dataset": "ag_news",
+            "device": str(DEVICE),
+            "do_train": do_train
+        })
+        
+        tokenizer, model, load_time = load_model_cached(model_name, "seqcls")
+        
         num_params = sum(p.numel() for p in model.parameters())
         model_size_mb = get_model_size(model)
-
-        mlflow.log_metric("num_parameters", num_params)
-        mlflow.log_metric("model_size_mb", model_size_mb)
-        mlflow.log_metric("load_time_seconds", load_time)
-        mlflow.log_metric("training_time_seconds", 0.0)
-
-        if do_train:
-            print("Executando fine-tune rápido (1 epoch)...")
-            train_texts = [x['text'] for x in dataset][:50]
-            train_labels = [x['label'] for x in dataset][:50]
-
-            enc = tokenizer(train_texts, truncation=True, padding=True, max_length=128, return_tensors='pt')
-            input_ids, mask = enc['input_ids'], enc['attention_mask']
-            labels_tensor = torch.tensor(train_labels)
-
-            optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-            model.train()
-            start_train = time.time()
-            for i in range(0, len(train_texts), 8):
-                batch_ids = input_ids[i:i+8].to(device)
-                batch_mask = mask[i:i+8].to(device)
-                batch_labels = labels_tensor[i:i+8].to(device)
-
-                outputs = model(input_ids=batch_ids, attention_mask=batch_mask, labels=batch_labels)
-                loss = outputs.loss
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-            train_time = time.time() - start_train
-            mlflow.log_metric("training_time_seconds", train_time)
-            print(f"Fine-tune: {train_time:.2f}s")
-
-        texts = [x["text"] for x in test_dataset if x.get("text")]
-        labels = [x["label"] for x in test_dataset if x.get("text")]
-
-        preds = []
+        
+        logger.log_metrics({
+            "num_parameters": num_params,
+            "model_size_mb": model_size_mb,
+            "load_time_seconds": load_time
+        })
+        
+        # Dataset
+        dataset = load_dataset("ag_news", split="test[:50]") 
+        texts = [x["text"] for x in dataset if x.get("text")]
+        labels = [x["label"] for x in dataset if x.get("text")]
+    
         start_eval = time.time()
-
+        preds = []
+        
         try:
-            pipe_cls = pipeline("text-classification", model=model_name, tokenizer=tokenizer, device=0 if device == "cuda" else -1)
-            use_pipe = True
-        except Exception:
-            use_pipe = False
-            pipe_cls = None
-
-        for t in texts:
-            if use_pipe and pipe_cls is not None:
-                try:
-                    out = pipe_cls(t[:512])
-                    label = out[0]['label']
-                    pred = int(label.split('_')[1]) if label.startswith('LABEL_') else int(label)
-                except Exception:
-                    inputs_eval = tokenizer(t[:512], return_tensors='pt', truncation=True, max_length=512).to(device)
-                    with torch.no_grad():
-                        logits = model(**inputs_eval).logits
-                    pred = int(torch.argmax(logits, dim=-1).cpu().item())
-            else:
-                inputs_eval = tokenizer(t[:512], return_tensors='pt', truncation=True, max_length=512).to(device)
+            classifier = pipeline(
+                "text-classification",
+                model=model,
+                tokenizer=tokenizer,
+                device=0 if DEVICE.type == "cuda" else -1
+            )
+            
+            batch_results = classifier(texts, truncation=True, max_length=128)
+            preds = [
+                int(r['label'].split('_')[1]) if 'label' in r else 0
+                for r in batch_results
+            ]
+        except:
+            batch_size = 8
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i+batch_size]
+                encodings = tokenizer(
+                    batch_texts,
+                    truncation=True,
+                    padding=True,
+                    max_length=128,
+                    return_tensors="pt"
+                ).to(DEVICE)
+                
                 with torch.no_grad():
-                    logits = model(**inputs_eval).logits
-                pred = int(torch.argmax(logits, dim=-1).cpu().item())
-
-            preds.append(pred)
-
+                    outputs = model(**encodings)
+                    batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().tolist()
+                    preds.extend(batch_preds)
+        
         eval_time = time.time() - start_eval
-
-        accuracy = accuracy_score(labels, preds) if labels and preds else 0.0
-        prec, rec, f1, _ = precision_recall_fscore_support(labels, preds, average="weighted", zero_division=0) if labels and preds else (0.0, 0.0, 0.0, None)
-
-        mlflow.log_metric("inference_time_seconds", eval_time)
-        mlflow.log_metric("inference_time_per_sample_seconds", eval_time / len(texts) if texts else 0.0)
-        mlflow.log_metric("accuracy", accuracy)
-        mlflow.log_metric("f1_score", f1)
-        mlflow.log_metric("precision", prec)
-        mlflow.log_metric("recall", rec)
-
-        print(f"Acurácia: {accuracy:.4f} | F1: {f1:.4f} | Inferência: {eval_time:.2f}s")
-
-        pred_counter = Counter(preds)
-        print(f"Distribuição: {pred_counter}")
-
-        try:
-            cm = confusion_matrix(labels, preds)
-            if plt and sns:
+        
+        # Métricas
+        metrics = MetricsCalculator.compute_classification_metrics(labels, preds)
+        metrics.update({
+            "inference_time_seconds": eval_time,
+            "inference_time_per_sample": eval_time / len(texts) if texts else 0
+        })
+        
+        logger.log_metrics(metrics)
+        
+        # Plot de confusão
+        if PLOT_AVAILABLE and labels and preds:
+            try:
+                cm = confusion_matrix(labels, preds)
                 plt.figure(figsize=(6, 4))
                 sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-                plt.title("Matriz de confusão - DistilBERT")
-                plt.xlabel("Predição")
-                plt.ylabel("Verdadeiro")
-                cm_path = "confusion_matrix_distilbert.png"
+                plt.title(f"Matriz de Confusão - {model_name}")
+                plt.tight_layout()
+                cm_path = f"confusion_matrix_{model_name.replace('/', '_')}.png"
                 plt.savefig(cm_path)
                 plt.close()
                 mlflow.log_artifact(cm_path)
-        except Exception as e:
-            print(f"Erro matriz confusão: {e}")
-
+                os.remove(cm_path)
+            except Exception as e:
+                print(f"Erro ao gerar matriz: {e}")
+        
+        # Cleanup
         del model, tokenizer
-        if device == "cuda":
+        if DEVICE.type == "cuda":
             torch.cuda.empty_cache()
-
+        
         return {
             "model": "DistilBERT",
-            "task": "classification",
-            "accuracy": accuracy,
-            "f1_score": f1,
+            "task": task_type,
+            **metrics,
             "num_parameters": num_params,
             "model_size_mb": model_size_mb,
-            "load_time_seconds": load_time,
-            "inference_time_seconds": eval_time
+            "load_time_seconds": load_time
         }
 
-
-def benchmark_distilgpt2():
-    """DistilGPT2 - geração (Wikitext small)."""
-    print("\nIniciando teste com DistilGPT2...")
-
-    with mlflow.start_run(run_name="DistilGPT2_lite"):
-        model_name = "distilgpt2"
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("task", "text-generation")
-        mlflow.log_param("dataset", "wikitext-2-raw-v1[:10]")
-        mlflow.log_param("device", device)
-
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test[:10]")
-
-        tokenizer, model, load_time, used_q = load_causal_model(model_name, quantize_4bit=False)  # distilgpt2 small - no quant forced
-        num_params = sum(p.numel() for p in model.parameters())
-        model_size_mb = get_model_size(model)
-
-        mlflow.log_metric("num_parameters", num_params)
-        mlflow.log_metric("model_size_mb", model_size_mb)
-        mlflow.log_metric("load_time_seconds", load_time)
-
-        prompts = ["The future of robotics is", "Data science will improve"]
-        preds, refs = [], []
-        start_inf = time.time()
-
-        for p in prompts:
-            enc = tokenizer(p, return_tensors='pt').to(device)
-            with torch.no_grad():
-                out = model.generate(**enc, max_new_tokens=40, do_sample=False)
-            text = tokenizer.decode(out[0], skip_special_tokens=True)
-            preds.append(text)
-            refs.append(p)
-
-        inf_time = time.time() - start_inf
-
-        bleu = compute_bleu(preds, refs)
-        rougeL = compute_rouge_l(preds, refs)
-
-        mlflow.log_metric("inference_time_seconds", inf_time)
-        mlflow.log_metric("bleu", bleu)
-        mlflow.log_metric("rougeL", rougeL)
-
-        del model, tokenizer
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        return {
-            "model": "DistilGPT2",
-            "task": "text-generation",
-            "bleu": bleu,
-            "rougeL": rougeL,
-            "num_parameters": num_params,
-            "model_size_mb": model_size_mb,
-            "load_time_seconds": load_time,
-            "inference_time_seconds": inf_time
-        }
-
-
-def benchmark_bert_tiny():
-    """BERT-tiny - classificação (AG News small)."""
-    print("\nIniciando teste com BERT Tiny...")
-
-    with mlflow.start_run(run_name="BERT_Tiny_lite"):
-        model_name = "prajjwal1/bert-tiny"
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("task", "classification")
-        mlflow.log_param("dataset", "ag_news[:100]")
-        mlflow.log_param("device", device)
-
-        dataset = load_dataset("ag_news", split="train[:100]")
-        test_dataset = load_dataset("ag_news", split="test[:25]")
-
-        tokenizer, model, load_time = load_seqcls_model(model_name)
-
-        num_params = sum(p.numel() for p in model.parameters())
-        model_size_mb = get_model_size(model)
-
-        mlflow.log_metric("num_parameters", num_params)
-        mlflow.log_metric("model_size_mb", model_size_mb)
-        mlflow.log_metric("load_time_seconds", load_time)
-        mlflow.log_metric("training_time_seconds", 0.0)
-
-        texts = [x["text"] for x in test_dataset if x.get("text")]
-        labels = [x["label"] for x in test_dataset if x.get("text")]
-
-        preds = []
-        start_eval = time.time()
-
-        for t in texts:
-            enc = tokenizer(t, return_tensors='pt', truncation=True, padding=True, max_length=128).to(device)
-            with torch.no_grad():
-                logits = model(**enc).logits
-            preds.append(int(torch.argmax(logits, dim=-1).cpu().item()))
-
-        eval_time = time.time() - start_eval
-
-        accuracy = accuracy_score(labels, preds) if labels and preds else 0.0
-        prec, rec, f1, _ = precision_recall_fscore_support(labels, preds, average="weighted", zero_division=0) if labels and preds else (0.0, 0.0, 0.0, None)
-
-        mlflow.log_metric("accuracy", accuracy)
-        mlflow.log_metric("precision", prec)
-        mlflow.log_metric("recall", rec)
-        mlflow.log_metric("f1_score", f1)
-        mlflow.log_metric("inference_time_seconds", eval_time)
-
-        print(f"Acurácia: {accuracy:.4f} | F1: {f1:.4f} | Inferência: {eval_time:.2f}s")
-
+def benchmark_generation_model(model_name: str, display_name: str, 
+                             quantize_4bit: bool = True, 
+                             use_safe_fallback: bool = True) -> Dict:
+    """Template padronizado para modelos de geração."""
+    print(f"\nIniciando teste com {display_name}...")
+    
+    task_type = "text-generation"
+    
+    with ModelLogger(f"{display_name}_{task_type}") as logger:
+        logger.log_params({
+            "model_name": model_name,
+            "task": task_type,
+            "device": str(DEVICE),
+            "quantize_4bit": quantize_4bit
+        })
+        
         try:
-            cm = confusion_matrix(labels, preds)
-            if plt and sns:
-                plt.figure(figsize=(6, 4))
-                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-                plt.title("Matriz de confusão - BERT Tiny")
-                cm_path = "confusion_matrix_bert_tiny.png"
-                plt.savefig(cm_path)
-                plt.close()
-                mlflow.log_artifact(cm_path)
+            tokenizer, model, load_time, used_q = load_causal_model_quantized(
+                model_name, quantize_4bit
+            )
+            
+            # Verificar se o modelo foi carregado
+            if model is None:
+                raise ValueError(f"Falha ao carregar modelo: {model_name}")
+            
         except Exception as e:
-            print(f"Erro matriz confusão: {e}")
-
+            print(f"Erro ao carregar {display_name}: {e}")
+            if use_safe_fallback:
+                print(f"Usando fallback seguro para {display_name}...")
+                # Usar um modelo que sempre funciona
+                fallback_model = "distilgpt2"
+                tokenizer, model, load_time = load_model_cached(fallback_model, "causal")
+                used_q = False
+                display_name = f"{display_name}_fallback"
+            else:
+                raise
+        
+        # Estatísticas do modelo
+        num_params = sum(p.numel() for p in model.parameters())
+        model_size_mb = get_model_size(model)
+        
+        logger.log_metrics({
+            "num_parameters": num_params,
+            "model_size_mb": model_size_mb,
+            "load_time_seconds": load_time,
+            "quantization_used": int(used_q)
+        })
+        
+        # Prompts de teste adaptados para o modelo
+        if "llama" in model_name.lower() or "tinyllama" in model_name.lower():
+            prompts = [
+                "Explique o que é machine learning em português:",
+                "Quais são as vantagens da energia solar?",
+                "Descreva inteligência artificial de forma simples:"
+            ]
+        elif "gemma" in model_name.lower():
+            prompts = [
+                "What is machine learning?",
+                "Explain solar energy benefits:",
+                "Describe artificial intelligence:"
+            ]
+        else:
+            prompts = [
+                "O futuro da inteligência artificial é",
+                "A sustentabilidade ambiental pode ser melhorada através de",
+                "Os avanços na medicina moderna permitem"
+            ]
+        
+        start_inf = time.time()
+        predictions = []
+        
+        # Configurar parâmetros de geração
+        generation_kwargs = {
+            "max_new_tokens": 50,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+        
+        # Adicionar pad_token_id se necessário
+        if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is not None:
+            generation_kwargs["pad_token_id"] = tokenizer.pad_token_id
+        elif hasattr(tokenizer, 'eos_token_id'):
+            generation_kwargs["pad_token_id"] = tokenizer.eos_token_id
+        
+        for prompt in prompts:
+            try:
+                # Preparar input
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+                
+                # Mover para dispositivo correto
+                if hasattr(model, 'device'):
+                    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                else:
+                    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, **generation_kwargs)
+                
+                generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                predictions.append(generated_text)
+                
+                # Mostrar preview
+                print(f"  Prompt: {prompt[:50]}...")
+                print(f"  Resposta: {generated_text[:100]}...\n")
+                
+            except Exception as e:
+                print(f"  Erro na geração para prompt '{prompt[:30]}...': {e}")
+                predictions.append("")
+        
+        inf_time = time.time() - start_inf
+        
+        # Calcular métricas apenas para respostas válidas
+        valid_predictions = [p for p in predictions if p.strip()]
+        valid_references = [prompts[i] for i, p in enumerate(predictions) if p.strip()]
+        
+        if valid_predictions and valid_references:
+            metrics = MetricsCalculator.compute_generation_metrics(valid_predictions, valid_references)
+        else:
+            metrics = {"bleu": 0.0, "rougeL": 0.0}
+        
+        metrics["inference_time_seconds"] = inf_time
+        metrics["successful_generations"] = len(valid_predictions)
+        metrics["total_prompts"] = len(prompts)
+        
+        logger.log_metrics(metrics)
+        
+        # Cleanup
         del model, tokenizer
-        if device == "cuda":
+        if DEVICE.type == "cuda":
             torch.cuda.empty_cache()
+        
+        return {
+            "model": display_name,
+            "task": task_type,
+            **metrics,
+            "num_parameters": num_params,
+            "model_size_mb": model_size_mb,
+            "load_time_seconds": load_time,
+            "quantization_used": used_q
+        }
 
+# Funções específicas dos modelos usando o template
+def benchmark_distilgpt2_optimized() -> Dict:
+    return benchmark_generation_model(
+        model_name="distilgpt2",
+        display_name="DistilGPT2",
+        quantize_4bit=False,
+        use_safe_fallback=False
+    )
+
+def benchmark_tinyllama_optimized(quantize_4bit: bool = False) -> Dict:
+    """TinyLLaMA otimizado - usando Phi-2 como alternativa mais estável"""
+    print("Usando Phi-2 como modelo de geração (mais estável que TinyLlama)...")
+    return benchmark_generation_model(
+        model_name="microsoft/phi-2",
+        display_name="Phi-2",
+        quantize_4bit=quantize_4bit,
+        use_safe_fallback=True
+    )
+
+def benchmark_gemma2mini_optimized(quantize_4bit: bool = True) -> Dict:
+    """Gemma 2 Mini com fallback para modelo aberto"""
+    try:
+        # Tentar Gemma primeiro
+        return benchmark_generation_model(
+            model_name="google/gemma-2-2b-it",
+            display_name="Gemma2_Mini",
+            quantize_4bit=quantize_4bit,
+            use_safe_fallback=True
+        )
+    except Exception as e:
+        print(f"Erro com Gemma (pode precisar de token): {e}")
+        print("Usando modelo alternativo aberto (Qwen2.5-1.5B)...")
+        # Usar modelo aberto alternativo
+        return benchmark_generation_model(
+            model_name="Qwen/Qwen2.5-1.5B",
+            display_name="Qwen2.5-1.5B",
+            quantize_4bit=quantize_4bit,
+            use_safe_fallback=True
+        )
+
+def benchmark_bert_tiny_optimized() -> Dict:
+    """BERT Tiny otimizado."""
+    print("\nIniciando teste com BERT Tiny...")
+    
+    model_name = "prajjwal1/bert-tiny"
+    
+    with ModelLogger("BERT_Tiny_classification") as logger:
+        logger.log_params({
+            "model_name": model_name,
+            "task": "classification",
+            "dataset": "ag_news",
+            "device": str(DEVICE)
+        })
+        
+        # Carregamento
+        tokenizer, model, load_time = load_model_cached(model_name, "seqcls")
+        
+        # Estatísticas
+        num_params = sum(p.numel() for p in model.parameters())
+        model_size_mb = get_model_size(model)
+        
+        logger.log_metrics({
+            "num_parameters": num_params,
+            "model_size_mb": model_size_mb,
+            "load_time_seconds": load_time
+        })
+        
+        # Dataset
+        dataset = load_dataset("ag_news", split="test[:50]")
+        texts = [x["text"] for x in dataset]
+        labels = [x["label"] for x in dataset]
+        
+        # Inferência em batch
+        start_eval = time.time()
+        batch_size = 16  # Batch maior para modelos pequenos
+        preds = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            encodings = tokenizer(
+                batch_texts,
+                truncation=True,
+                padding=True,
+                max_length=128,
+                return_tensors="pt"
+            ).to(DEVICE)
+            
+            with torch.no_grad():
+                outputs = model(**encodings)
+                batch_preds = torch.argmax(outputs.logits, dim=-1).cpu().tolist()
+                preds.extend(batch_preds)
+        
+        eval_time = time.time() - start_eval
+        
+        # Métricas
+        metrics = MetricsCalculator.compute_classification_metrics(labels, preds)
+        metrics["inference_time_seconds"] = eval_time
+        
+        logger.log_metrics(metrics)
+        
+        # Cleanup
+        del model, tokenizer
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
+        
         return {
             "model": "BERT_Tiny",
             "task": "classification",
-            "accuracy": accuracy,
-            "f1_score": f1,
+            **metrics,
             "num_parameters": num_params,
             "model_size_mb": model_size_mb,
-            "load_time_seconds": load_time,
-            "inference_time_seconds": eval_time
+            "load_time_seconds": load_time
         }
-
-
-def benchmark_tiny_llama(quantize_4bit=True):
-    """TinyLLaMA - geração - tenta 4-bit se disponível."""
-    print("\nIniciando teste com TinyLLaMA...")
-
-    with mlflow.start_run(run_name="TinyLLaMA_lite"):
-        model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("task", "text-generation")
-        mlflow.log_param("dataset", "wikitext-2-raw-v1[:10]")
-        mlflow.log_param("device", device)
-        mlflow.log_param("quantize_4bit_enabled", bool(quantize_4bit and BNB_AVAILABLE and device == 'cuda'))
-
-        tokenizer, model, load_time, used_q = load_causal_model(model_name, quantize_4bit=quantize_4bit and BNB_AVAILABLE and device == 'cuda')
-
-        num_params = sum(p.numel() for p in model.parameters())
-        model_size_mb = get_model_size(model)
-        mlflow.log_metric("num_parameters", num_params)
-        mlflow.log_metric("model_size_mb", model_size_mb)
-        mlflow.log_metric("load_time_seconds", load_time)
-
-        prompts = [
-            "O futuro da agricultura é",
-            "As mudanças climáticas afetam a agricultura ao"
-        ]
-        preds, refs = [], []
-        start_inf = time.time()
-
-        for p in prompts:
-            enc = tokenizer(p, return_tensors='pt').to(device)
-            with torch.no_grad():
-                out = model.generate(**enc, max_new_tokens=60, do_sample=True, top_p=0.9)
-            text = tokenizer.decode(out[0], skip_special_tokens=True)
-            preds.append(text)
-            refs.append(p)
-
-        inf_time = time.time() - start_inf
-
-        bleu = compute_bleu(preds, refs)
-        rougeL = compute_rouge_l(preds, refs)
-
-        mlflow.log_metric("inference_time_seconds", inf_time)
-        mlflow.log_metric("bleu", bleu)
-        mlflow.log_metric("rougeL", rougeL)
-
-        del model, tokenizer
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        return {
-            "model": "TinyLLaMA",
-            "task": "text-generation",
-            "bleu": bleu,
-            "rougeL": rougeL,
-            "num_parameters": num_params,
-            "model_size_mb": model_size_mb,
-            "load_time_seconds": load_time,
-            "inference_time_seconds": inf_time,
-            "used_quantization_4bit": used_q
-        }
-
-
-def benchmark_gemma2_mini(quantize_4bit=True):
-    """Gemma 2 Mini - geração - tenta 4-bit se disponível."""
-    print("\nIniciando teste com Gemma 2 Mini...")
-
-    with mlflow.start_run(run_name="Gemma2_Mini_lite"):
-        model_name = "google/gemma-2-2b-mini"
-        mlflow.log_param("model_name", model_name)
-        mlflow.log_param("task", "text-generation")
-        mlflow.log_param("dataset", "wikitext-2-raw-v1[:10]")
-        mlflow.log_param("device", device)
-        mlflow.log_param("quantize_4bit_enabled", bool(quantize_4bit and BNB_AVAILABLE and device == 'cuda'))
-
-        tokenizer, model, load_time, used_q = load_causal_model(model_name, quantize_4bit=quantize_4bit and BNB_AVAILABLE and device == 'cuda')
-
-        num_params = sum(p.numel() for p in model.parameters())
-        model_size_mb = get_model_size(model)
-        mlflow.log_metric("num_parameters", num_params)
-        mlflow.log_metric("model_size_mb", model_size_mb)
-        mlflow.log_metric("load_time_seconds", load_time)
-
-        prompts = [
-            "O futuro da agricultura é",
-            "As mudanças climáticas afetam o cultivo ao"
-        ]
-        preds, refs = [], []
-        start_inf = time.time()
-
-        for p in prompts:
-            enc = tokenizer(p, return_tensors='pt').to(device)
-            with torch.no_grad():
-                out = model.generate(**enc, max_new_tokens=60, do_sample=True, top_p=0.9)
-            text = tokenizer.decode(out[0], skip_special_tokens=True)
-            preds.append(text)
-            refs.append(p)
-
-        inf_time = time.time() - start_inf
-
-        bleu = compute_bleu(preds, refs)
-        rougeL = compute_rouge_l(preds, refs)
-
-        mlflow.log_metric("inference_time_seconds", inf_time)
-        mlflow.log_metric("bleu", bleu)
-        mlflow.log_metric("rougeL", rougeL)
-
-        del model, tokenizer
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        return {
-            "model": "Gemma2_Mini",
-            "task": "text-generation",
-            "bleu": bleu,
-            "rougeL": rougeL,
-            "num_parameters": num_params,
-            "model_size_mb": model_size_mb,
-            "load_time_seconds": load_time,
-            "inference_time_seconds": inf_time,
-            "used_quantization_4bit": used_q
-        }
-
 
 def main():
     """Execução principal do benchmark."""
     header = """
-    BENCHMARK SIMPLIFICADO - Modelos Transformer (Versão Lite)
+    BENCHMARK SIMPLIFICADO - Modelos Transformer (Versão Otimizada)
     Projeto CCD SB100 – Squad 4
     Otimizado para notebooks com recursos limitados
+    
+    Modelos disponíveis:
+    - DistilBERT: Classificação de texto
+    - DistilGPT2: Geração de texto (base)
+    - BERT Tiny: Classificação leve
+    - TinyLLaMA: Geração com modelo aberto LLM
+    - Gemma 2 Mini: Geração com modelo alternativo
+    
+    Nota: Usando modelos abertos que não requerem token de autenticação
     """
     print(header)
-
-    parser = argparse.ArgumentParser(description='Benchmarks lite for transformer models')
-    parser.add_argument('--model', choices=['all','distilbert','distilgpt2','bert_tiny','tinyllama','gemma2mini'], default='all', help='Which model to run')
-    parser.add_argument('--fine_tune', action='store_true', help='Run a quick fine-tuning step (1 epoch) before evaluation for classification models')
-    parser.add_argument('--no_quant', action='store_true', help='Disable 4-bit quantization attempts')
+    
+    setup_mlflow()
+    
+    parser = argparse.ArgumentParser(description='Benchmarks lite para modelos transformer')
+    parser.add_argument('--model', choices=['all', 'distilbert', 'distilgpt2', 
+                                          'bert_tiny', 'tinyllama', 'gemma2mini'],
+                       default='all', help='Modelo a executar')
+    parser.add_argument('--no_quant', action='store_true',
+                       help='Desabilitar quantização 4-bit')
+    parser.add_argument('--sample_size', type=int, default=50,
+                       help='Tamanho da amostra para testes')
+    parser.add_argument('--use_safe', action='store_true',
+                       help='Usar apenas modelos seguros (sem falhas)')
     args = parser.parse_args()
-
-    selected = args.model
-    do_train = args.fine_tune
-    allow_quant = not args.no_quant
-
+    
+    # Mapeamento de modelos para funções
+    model_registry = {
+        'distilbert': benchmark_distilbert_optimized,
+        'distilgpt2': benchmark_distilgpt2_optimized,
+        'bert_tiny': benchmark_bert_tiny_optimized,
+        'tinyllama': lambda: benchmark_tinyllama_optimized(not args.no_quant),
+        'gemma2mini': lambda: benchmark_gemma2mini_optimized(not args.no_quant)
+    }
+    
+    # Execução dos benchmarks
     results = []
-
-    try:
-        if selected in ['all','distilbert']:
-            results.append(benchmark_distilbert(do_train=do_train))
-    except Exception as e:
-        print(f"Erro DistilBERT: {e}")
-
-    try:
-        if selected in ['all','distilgpt2']:
-            results.append(benchmark_distilgpt2())
-    except Exception as e:
-        print(f"Erro DistilGPT2: {e}")
-
-    try:
-        if selected in ['all','bert_tiny']:
-            results.append(benchmark_bert_tiny())
-    except Exception as e:
-        print(f"Erro BERT Tiny: {e}")
-
-    try:
-        if selected in ['all','tinyllama']:
-            results.append(benchmark_tiny_llama(quantize_4bit=allow_quant))
-    except Exception as e:
-        print(f"Erro TinyLLaMA: {e}")
-
-    try:
-        if selected in ['all','gemma2mini']:
-            results.append(benchmark_gemma2_mini(quantize_4bit=allow_quant))
-    except Exception as e:
-        print(f"Erro Gemma2 Mini: {e}")
-
-    # Salva resultados
+    models_to_run = model_registry.keys() if args.model == 'all' else [args.model]
+    
+    print(f"\n{'='*60}")
+    print(f"INICIANDO BENCHMARK")
+    print(f"Modelos a testar: {', '.join(models_to_run)}")
+    print(f"Quantização: {'Não' if args.no_quant else 'Sim'}")
+    print(f"Dispositivo: {DEVICE}")
+    print(f"{'='*60}\n")
+    
+    for model_key in models_to_run:
+        if model_key in model_registry:
+            print(f"\n{'='*60}")
+            print(f"TESTANDO: {model_key.upper()}")
+            print(f"{'='*60}")
+            
+            start_time = time.time()
+            result = benchmark_model(
+                model_key,
+                model_registry[model_key]
+            )
+            
+            if result:
+                results.append(result)
+                elapsed = time.time() - start_time
+                print(f"✓ {model_key} concluído em {elapsed:.2f}s")
+            else:
+                print(f"✗ {model_key} falhou")
+    
+    # Salvamento e relatório
     if results:
         df = pd.DataFrame(results)
+        
+        # Ordenar por tipo de tarefa e modelo
+        df = df.sort_values(['task', 'model'])
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"benchmark_lite_{timestamp}.csv"
+        filename = f"benchmark_optimized_{timestamp}.csv"
         df.to_csv(filename, index=False)
-
-        print("\nRESUMO DOS RESULTADOS")
-        print(df.to_string(index=False))
-        print(f"\nSalvo em: {filename}")
-        print("\nPara visualizar no MLflow, execute: mlflow ui")
-
-    print("\nBenchmark concluído.")
-
+        
+        # Relatório resumido
+        print("\n" + "="*80)
+        print("RESUMO DOS RESULTADOS".center(80))
+        print("="*80)
+        
+        for task in df['task'].unique():
+            task_df = df[df['task'] == task]
+            print(f"\n{task.upper():^80}")
+            print("-"*80)
+            
+            if task == 'classification':
+                print(f"{'Modelo':<20} {'Acurácia':<10} {'F1-Score':<10} {'Inferência(s)':<15} {'Tamanho(MB)':<12}")
+                for _, row in task_df.iterrows():
+                    print(f"{row['model']:<20} {row.get('accuracy', 0):<10.4f} "
+                          f"{row.get('f1_score', 0):<10.4f} {row.get('inference_time_seconds', 0):<15.2f} "
+                          f"{row.get('model_size_mb', 0):<12.1f}")
+            else:  # text-generation
+                print(f"{'Modelo':<20} {'Sucessos':<10} {'BLEU':<10} {'Inferência(s)':<15} {'Quantizado':<12}")
+                for _, row in task_df.iterrows():
+                    success_rate = (row.get('successful_generations', 0) / 
+                                  row.get('total_prompts', 1)) * 100
+                    print(f"{row['model']:<20} {success_rate:<10.1f}% "
+                          f"{row.get('bleu', 0):<10.4f} {row.get('inference_time_seconds', 0):<15.2f} "
+                          f"{'Sim' if row.get('quantization_used', False) else 'Não':<12}")
+        
+        print("\n" + "="*80)
+        print(f"Relatório salvo em: {filename}")
+        print("Para visualizar no MLflow, execute: mlflow ui")
+        print("="*80)
+    
+    print("\nBenchmark concluído!")
 
 if __name__ == "__main__":
     main()

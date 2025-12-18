@@ -1,4 +1,4 @@
-from benchmark_lite import benchmark_gemini
+from benchmark_definitivo import benchmark_gemma2mini_optimized
 
 if __name__ == '__main__':
-    benchmark_gemini()
+    benchmark_gemma2mini_optimized()

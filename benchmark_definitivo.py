@@ -441,24 +441,24 @@ def benchmark_generation_model(model_name: str, display_name: str,
             "quantization_used": int(used_q)
         })
         
-        # Prompts de teste adaptados para o modelo
+        # Prompts de teste adaptados para o modelo - foco em calagem e adubação
         if "llama" in model_name.lower() or "tinyllama" in model_name.lower():
             prompts = [
-                "Explique o que é machine learning em português:",
-                "Quais são as vantagens da energia solar?",
-                "Descreva inteligência artificial de forma simples:"
+                "Como determinar a necessidade de calagem em solos ácidos?",
+                "Quais são as recomendações de adubação para culturas de milho?",
+                "Explique a diferença entre calagem e gessagem em solos agrícolas:"
             ]
         elif "gemma" in model_name.lower():
             prompts = [
-                "What is machine learning?",
-                "Explain solar energy benefits:",
-                "Describe artificial intelligence:"
+                "How to determine lime requirement in acidic soils?",
+                "What are fertilizer recommendations for corn crops?",
+                "Explain the difference between liming and gypsum application:"
             ]
         else:
             prompts = [
-                "O futuro da inteligência artificial é",
-                "A sustentabilidade ambiental pode ser melhorada através de",
-                "Os avanços na medicina moderna permitem"
+                "A calagem em solos agrícolas visa corrigir",
+                "As recomendações de adubação nitrogenada para café dependem",
+                "A aplicação de fósforo no plantio deve considerar"
             ]
         
         start_inf = time.time()

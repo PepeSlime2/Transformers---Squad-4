@@ -5,7 +5,7 @@ Este documento descreve os arquivos principais e indica como começar com o repo
 
 Arquivos principais
 -------------------
-- `benchmark_lite.py` — script principal para executar benchmarks (versão leve, inference-only).
+- `benchmark_definitivo.py` — script principal para executar benchmarks (versão definitiva, usado pelos experimentos).
 - `requirements.txt` — lista de dependências para instalar.
 - `agricultural_data.py` — exemplos de dados sintéticos para testes.
 - `mlruns/` — diretório onde o MLflow salva os experimentos.
@@ -17,7 +17,7 @@ Como começar
 -------------
 1. Crie e ative um ambiente virtual.
 2. Instale as dependências: `pip install -r requirements.txt`.
-3. Rode `python benchmark_lite.py` para um teste rápido.
+3. Rode `python benchmark_definitivo.py` para um teste rápido.
 4. Inicie o MLflow UI: `mlflow ui --host 127.0.0.1 --port 5001`.
 
 Principais pastas e arquivos gerados
@@ -42,9 +42,22 @@ transformer_test/
 │
 ├── 🎯 Scripts Principais
 │   ├── benchmark_transformers_sb100.py    # Script completo de benchmark
-│   ├── benchmark_lite.py                  # Versão otimizada para hardware limitado
+│   ├── benchmark_lite.py                  # Versão otimizada para hardware limitado (não usado)
+│   ├── benchmark_definitivo.py            # Script definitivo de benchmark (usado pelos experimentos)
 │   ├── test_agricultural_models.py        # Testes com dados do domínio agrícola
 │   └── agricultural_data.py               # Dataset de exemplos agrícolas
+│
+├── 🧪 Experimentos Individuais
+│   └── experiments/
+│       ├── run_all_experiments.py          # Executa todos os experimentos
+│       ├── transformers_geracao.py         # Experimento: modelos de geração
+│       ├── transformers_classificacao.py   # Experimento: modelos de classificação
+│       ├── bert_tiny_experiment.py         # BERT Tiny (classificação)
+│       ├── chronos_experiment.py           # Chronos (forecasting) - não implementado
+│       ├── distilbert_experiment.py        # DistilBERT (classificação)
+│       ├── distilgpt2_experiment.py        # DistilGPT-2 (geração)
+│       ├── gemini_experiment.py            # Gemma 2 Mini (geração)
+│       └── tinyllama_experiment.py         # TinyLlama (geração)
 │
 ├── 📚 Documentação
 │   ├── README.md                          # Documentação completa do projeto
@@ -88,7 +101,7 @@ transformer_test/
 
 | Objetivo | Arquivo | Hardware Necessário |
 |----------|---------|-------------------|
-| Teste rápido | `benchmark_lite.py` | 4GB+ RAM |
+| Teste rápido | `benchmark_definitivo.py` | 4GB+ RAM |
 | Benchmark completo | `benchmark_transformers_sb100.py` | 8GB+ RAM |
 | Testar com dados agrícolas | `test_agricultural_models.py` | 4GB+ RAM |
 | Ver exemplos de dados | `agricultural_data.py` | Qualquer |
